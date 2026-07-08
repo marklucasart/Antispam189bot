@@ -1,17 +1,29 @@
 import logging
 import sqlite3
 import re
+import os
 from datetime import datetime, timedelta
 from collections import defaultdict
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 
 # --- Configuration ---
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # <--- REPLACE WITH YOUR TOKEN FROM @BotFather
-ADMIN_IDS = []  # List of admin user IDs (integers), e.g., [123456789, 987654321]
+# Get token from environment variable (Railway) or hardcode as fallback
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    print("⚠️ WARNING: Using hardcoded token. Set BOT_TOKEN environment variable for production.")
+
+# Admin IDs - can also be set via environment variable
+ADMIN_IDS = []
+admin_ids_str = os.environ.get("ADMIN_IDS", "")
+if admin_ids_str:
+    ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 
 # --- Logging Setup ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # --- Database Setup ---
@@ -26,30 +38,16 @@ def init_db():
                  (group_id INTEGER PRIMARY KEY, 
                   warn_limit INTEGER DEFAULT 3,
                   mute_duration INTEGER DEFAULT 300,
-                  auto_delete_spam BOOLEAN DEFAULT 1)''')
+                  auto_delete_spam INTEGER DEFAULT 1)''')
     c.execute('''CREATE TABLE IF NOT EXISTS approved_links
                  (group_id INTEGER, link TEXT, PRIMARY KEY (group_id, link))''')
     conn.commit()
     conn.close()
+    logger.info("Database initialized successfully")
 
 init_db()
 
 # --- Database Helper Functions ---
-def get_setting(group_id, key, default):
-    conn = sqlite3.connect('spam_data.db')
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE group_id=?", (group_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        # Simple mapping for our known settings
-        settings = {'warn_limit': 3, 'mute_duration': 300, 'auto_delete_spam': 1}
-        # This is a simplified retrieval. A better way: store as JSON or separate columns.
-        # For this robust version, we'll use separate columns.
-        return default
-    return default
-
-# Re-implement with better column handling
 def get_warn_limit(group_id):
     conn = sqlite3.connect('spam_data.db')
     c = conn.cursor()
@@ -98,9 +96,10 @@ def get_warnings(user_id, group_id):
 def add_warning(user_id, group_id):
     conn = sqlite3.connect('spam_data.db')
     c = conn.cursor()
+    now = datetime.now().isoformat()
     c.execute("INSERT INTO warnings (user_id, group_id, count, last_warning) VALUES (?, ?, 1, ?) "
-              "ON CONFLICT(user_id, group_id) DO UPDATE SET count=count+1, last_warning=excluded.last_warning",
-              (user_id, group_id, datetime.now()))
+              "ON CONFLICT(user_id, group_id) DO UPDATE SET count=count+1, last_warning=?",
+              (user_id, group_id, now, now))
     conn.commit()
     conn.close()
 
@@ -134,12 +133,10 @@ def remove_approved_link(group_id, link):
     conn.close()
 
 # --- Core Anti-Spam Logic ---
-# Simple spam patterns (can be expanded)
 SPAM_PATTERNS = [
-    r'(https?://[^\s]+){3,}',  # More than 3 links
-    r'\b(free|earn|cash|click|win|prize|offer|limited|discount|bonus)\b.*\b(now|today|click|here)\b',  # Promotional language
-    r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # Email addresses (optional)
-    r'\b(bit\.ly|tinyurl|shorturl|goo\.gl|ow\.ly|is\.gd|buff\.ly|t\.co)\b', # URL shorteners
+    r'(https?://[^\s]+){3,}',
+    r'\b(free|earn|cash|click|win|prize|offer|limited|discount|bonus|gift|giveaway)\b.*\b(now|today|click|here|link)\b',
+    r'\b(bit\.ly|tinyurl|shorturl|goo\.gl|ow\.ly|is\.gd|buff\.ly|t\.co|cutt\.ly|rb\.gy)\b',
 ]
 
 def is_spam(text):
@@ -148,7 +145,7 @@ def is_spam(text):
         return False
     text_lower = text.lower()
     for pattern in SPAM_PATTERNS:
-        if re.search(pattern, text_lower):
+        if re.search(pattern, text_lower, re.IGNORECASE):
             return True
     return False
 
@@ -156,19 +153,18 @@ async def handle_message(update: Update, context: CallbackContext):
     """Process each message for spam."""
     if not update.message or not update.message.from_user:
         return
+    
     user = update.message.from_user
     chat = update.message.chat
+    
+    # Ignore bots and private chats
+    if user.is_bot or chat.type not in ['group', 'supergroup']:
+        return
+
+    # Get message text
     message_text = update.message.text or update.message.caption or ""
 
-    # Ignore messages from admins and bots
-    if user.is_bot:
-        return
-    if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("This bot works only in groups.")
-        return
-
-    # Check admin status (simple: if user is in ADMIN_IDS or has explicit admin rights - we'll check via bot)
-    # For simplicity, we assume the bot has admin rights and can check status.
+    # Check admin status
     try:
         chat_member = await context.bot.get_chat_member(chat.id, user.id)
         if chat_member.status in ['administrator', 'creator']:
@@ -177,23 +173,23 @@ async def handle_message(update: Update, context: CallbackContext):
         logger.error(f"Error checking admin status: {e}")
         return
 
-    # 1. Check if it's spam based on content
-    if is_spam(message_text) or (message_text and any(domain in message_text.lower() for domain in ['bit.ly', 'tinyurl', 'shorturl'])):
+    # Check for spam
+    if is_spam(message_text):
         warn_limit = get_warn_limit(chat.id)
         current_warnings = get_warnings(user.id, chat.id)
 
-        # Delete spam message if setting is enabled
+        # Delete spam message
         if get_auto_delete(chat.id):
             try:
                 await update.message.delete()
             except Exception as e:
                 logger.error(f"Could not delete message: {e}")
 
-        # Add a warning
+        # Add warning
         add_warning(user.id, chat.id)
         new_warnings = current_warnings + 1
 
-        # Prepare warning message
+        # Send warning
         warning_text = f"🚨 Spam detected! {user.mention_html()} has received warning {new_warnings}/{warn_limit}."
         sent_msg = await update.message.reply_html(warning_text)
 
@@ -211,161 +207,98 @@ async def handle_message(update: Update, context: CallbackContext):
                     f"🚫 {user.mention_html()} has been muted for {mute_duration//60} minutes due to spam.",
                     parse_mode='HTML'
                 )
-                reset_warnings(user.id, chat.id)  # Reset warnings after mute
+                reset_warnings(user.id, chat.id)
             except Exception as e:
                 logger.error(f"Could not mute user: {e}")
-                await sent_msg.edit_text(f"⚠️ Could not mute {user.mention_html()}. Check bot permissions.", parse_mode='HTML')
-        else:
-            # Auto-delete warning after some time? We'll keep it.
-            pass
+                await sent_msg.edit_text(
+                    f"⚠️ Could not mute {user.mention_html()}. Check bot permissions.",
+                    parse_mode='HTML'
+                )
 
 # --- Admin Commands ---
 async def set_warn_limit(update: Update, context: CallbackContext):
-    """Set the number of warnings before mute. /setlimit <number>"""
-    if not update.message or not update.message.from_user:
+    """Set the number of warnings before mute."""
+    if not await is_admin(update, context):
         return
-    user = update.message.from_user
-    chat = update.message.chat
-    if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this command in a group.")
-        return
-
-    # Check if user is admin
-    try:
-        chat_member = await context.bot.get_chat_member(chat.id, user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("Only admins can use this command.")
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        return
-
+    
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /setlimit <number> (e.g., /setlimit 5)")
         return
+    
     limit = int(args[0])
     if limit < 1:
         await update.message.reply_text("Limit must be at least 1.")
         return
-    update_settings(chat.id, warn_limit=limit)
+    
+    update_settings(update.message.chat.id, warn_limit=limit)
     await update.message.reply_text(f"✅ Warning limit set to {limit}.")
 
 async def set_mute_duration(update: Update, context: CallbackContext):
-    """Set mute duration in seconds. /setmute <seconds>"""
-    if not update.message or not update.message.from_user:
+    """Set mute duration in seconds."""
+    if not await is_admin(update, context):
         return
-    user = update.message.from_user
-    chat = update.message.chat
-    if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this command in a group.")
-        return
-
-    try:
-        chat_member = await context.bot.get_chat_member(chat.id, user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("Only admins can use this command.")
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        return
-
+    
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /setmute <seconds> (e.g., /setmute 600)")
         return
+    
     duration = int(args[0])
     if duration < 30:
         await update.message.reply_text("Duration must be at least 30 seconds.")
         return
-    update_settings(chat.id, mute_duration=duration)
+    
+    update_settings(update.message.chat.id, mute_duration=duration)
     await update.message.reply_text(f"✅ Mute duration set to {duration} seconds ({duration//60} minutes).")
 
 async def toggle_auto_delete(update: Update, context: CallbackContext):
-    """Toggle automatic deletion of spam messages. /autodelete on/off"""
-    if not update.message or not update.message.from_user:
+    """Toggle automatic deletion of spam messages."""
+    if not await is_admin(update, context):
         return
-    user = update.message.from_user
-    chat = update.message.chat
-    if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this command in a group.")
-        return
-
-    try:
-        chat_member = await context.bot.get_chat_member(chat.id, user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("Only admins can use this command.")
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        return
-
+    
     args = context.args
     if not args or args[0].lower() not in ['on', 'off']:
         await update.message.reply_text("Usage: /autodelete on/off")
         return
+    
     status = args[0].lower() == 'on'
-    update_settings(chat.id, auto_delete_spam=status)
+    update_settings(update.message.chat.id, auto_delete_spam=status)
     await update.message.reply_text(f"✅ Auto-delete {'enabled' if status else 'disabled'}.")
 
 async def approve_link(update: Update, context: CallbackContext):
-    """Approve a domain/link so it won't be flagged as spam. /approve example.com"""
-    if not update.message or not update.message.from_user:
+    """Approve a domain/link so it won't be flagged as spam."""
+    if not await is_admin(update, context):
         return
-    user = update.message.from_user
-    chat = update.message.chat
-    if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this command in a group.")
-        return
-
-    try:
-        chat_member = await context.bot.get_chat_member(chat.id, user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("Only admins can use this command.")
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        return
-
+    
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /approve domain.com")
         return
+    
     link = args[0].lower()
-    add_approved_link(chat.id, link)
+    add_approved_link(update.message.chat.id, link)
     await update.message.reply_text(f"✅ '{link}' has been added to the approved list.")
 
 async def remove_approved(update: Update, context: CallbackContext):
-    """Remove an approved link. /remove domain.com"""
-    if not update.message or not update.message.from_user:
+    """Remove an approved link."""
+    if not await is_admin(update, context):
         return
-    user = update.message.from_user
-    chat = update.message.chat
-    if chat.type not in ['group', 'supergroup']:
-        await update.message.reply_text("Use this command in a group.")
-        return
-
-    try:
-        chat_member = await context.bot.get_chat_member(chat.id, user.id)
-        if chat_member.status not in ['administrator', 'creator']:
-            await update.message.reply_text("Only admins can use this command.")
-            return
-    except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        return
-
+    
     args = context.args
     if not args:
         await update.message.reply_text("Usage: /remove domain.com")
         return
+    
     link = args[0].lower()
-    remove_approved_link(chat.id, link)
+    remove_approved_link(update.message.chat.id, link)
     await update.message.reply_text(f"✅ '{link}' removed from approved list.")
 
 async def status(update: Update, context: CallbackContext):
-    """Show current settings for the group. /status"""
+    """Show current settings for the group."""
     if not update.message or not update.message.from_user:
         return
+    
     chat = update.message.chat
     if chat.type not in ['group', 'supergroup']:
         await update.message.reply_text("Use this command in a group.")
@@ -374,12 +307,13 @@ async def status(update: Update, context: CallbackContext):
     warn_limit = get_warn_limit(chat.id)
     mute_duration = get_mute_duration(chat.id)
     auto_delete = get_auto_delete(chat.id)
+    
     await update.message.reply_text(
         f"🛡️ **Anti-Spam Settings for this group**\n"
         f"• Warning Limit: {warn_limit}\n"
         f"• Mute Duration: {mute_duration} seconds ({mute_duration//60} min)\n"
-        f"• Auto-Delete Spam: {'Enabled' if auto_delete else 'Disabled'}\n"
-        f"• Approved Links: (Check your admin list)",
+        f"• Auto-Delete Spam: {'✅ Enabled' if auto_delete else '❌ Disabled'}\n"
+        f"• Bot Status: 🟢 Active",
         parse_mode='Markdown'
     )
 
@@ -388,7 +322,7 @@ async def help_command(update: Update, context: CallbackContext):
     help_text = (
         "🤖 **Anti-Spam Bot Help**\n\n"
         "This bot detects and prevents spam in groups.\n\n"
-        "**Commands:**\n"
+        "**Admin Commands:**\n"
         "/setlimit <number> - Set warnings before mute\n"
         "/setmute <seconds> - Set mute duration\n"
         "/autodelete on/off - Toggle auto-deletion of spam\n"
@@ -396,9 +330,38 @@ async def help_command(update: Update, context: CallbackContext):
         "/remove <domain> - Remove domain from whitelist\n"
         "/status - Show current settings\n"
         "/help - Show this message\n\n"
-        "**Admin Only:** All commands (except /help) are admin-only."
+        "**All commands (except /help) are admin-only.**"
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def is_admin(update: Update, context: CallbackContext) -> bool:
+    """Check if user is admin in the group."""
+    if not update.message or not update.message.from_user:
+        return False
+    
+    user = update.message.from_user
+    chat = update.message.chat
+    
+    if chat.type not in ['group', 'supergroup']:
+        await update.message.reply_text("Use this command in a group.")
+        return False
+    
+    # Check if user is in ADMIN_IDS
+    if user.id in ADMIN_IDS:
+        return True
+    
+    # Check Telegram admin status
+    try:
+        chat_member = await context.bot.get_chat_member(chat.id, user.id)
+        if chat_member.status in ['administrator', 'creator']:
+            return True
+        else:
+            await update.message.reply_text("⚠️ Only admins can use this command.")
+            return False
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await update.message.reply_text("❌ Error verifying admin status.")
+        return False
 
 # --- Error Handler ---
 async def error_handler(update: object, context: CallbackContext):
@@ -407,12 +370,22 @@ async def error_handler(update: object, context: CallbackContext):
 # --- Main Function ---
 def main():
     """Start the bot."""
-    # Create Application
-    application = Application.builder().token(BOT_TOKEN).build()
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.error("❌ BOT_TOKEN not set! Please set the BOT_TOKEN environment variable.")
+        return
+
+    logger.info("🚀 Starting Anti-Spam Bot...")
+    
+    # Create Application with proper configuration
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
     # Message handler for spam detection
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.CAPTION, handle_message))  # For media with captions
+    application.add_handler(MessageHandler(filters.CAPTION, handle_message))
 
     # Command handlers
     application.add_handler(CommandHandler("setlimit", set_warn_limit))
@@ -426,8 +399,8 @@ def main():
     # Error handler
     application.add_error_handler(error_handler)
 
-    # Start the Bot
-    logger.info("Bot started...")
+    # Start the Bot with proper settings
+    logger.info("✅ Bot is running and ready to moderate!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
