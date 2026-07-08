@@ -3,7 +3,7 @@ import logging
 import sqlite3
 import re
 import sys
-import time
+import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -277,7 +277,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤖 Anti-Spam Bot is running!")
 
 # --- Main ---
-def main():
+async def main():
     logger.info("🚀 Starting Anti-Spam Bot...")
     
     # Create application
@@ -295,26 +295,27 @@ def main():
     
     logger.info("✅ Bot is ready!")
     
+    # Clear webhook properly
+    await app.bot.delete_webhook()
+    
     # Run with retry logic for conflicts
     max_retries = 3
     retry_delay = 5
     
     for attempt in range(max_retries):
         try:
-            # Clear webhook before starting
-            app.bot.delete_webhook()
-            app.run_polling(
+            await app.run_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
-                stop_signals=None  # Prevent signal issues on Railway
+                stop_signals=None
             )
             break
         except Conflict as e:
             logger.warning(f"Conflict error (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 logger.info(f"Waiting {retry_delay} seconds before retry...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
             else:
                 logger.error("Max retries exceeded. Exiting...")
                 sys.exit(1)
@@ -323,4 +324,7 @@ def main():
             sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
