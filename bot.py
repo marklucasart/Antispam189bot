@@ -2,6 +2,8 @@ import os
 import logging
 import sqlite3
 import re
+import sys
+import time
 from datetime import datetime, timedelta
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -11,9 +13,8 @@ from telegram.error import Conflict
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     logging.error("BOT_TOKEN environment variable not set!")
-    exit(1)
+    sys.exit(1)
 
-# Admin IDs (optional)
 ADMIN_IDS = []
 admin_ids_str = os.environ.get("ADMIN_IDS", "")
 if admin_ids_str:
@@ -105,28 +106,6 @@ def reset_warnings(user_id, group_id):
     conn = sqlite3.connect('spam_data.db')
     c = conn.cursor()
     c.execute("DELETE FROM warnings WHERE user_id=? AND group_id=?", (user_id, group_id))
-    conn.commit()
-    conn.close()
-
-def is_approved_link(group_id, link):
-    conn = sqlite3.connect('spam_data.db')
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM approved_links WHERE group_id=? AND link=?", (group_id, link))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
-
-def add_approved_link(group_id, link):
-    conn = sqlite3.connect('spam_data.db')
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO approved_links (group_id, link) VALUES (?, ?)", (group_id, link))
-    conn.commit()
-    conn.close()
-
-def remove_approved_link(group_id, link):
-    conn = sqlite3.connect('spam_data.db')
-    c = conn.cursor()
-    c.execute("DELETE FROM approved_links WHERE group_id=? AND link=?", (group_id, link))
     conn.commit()
     conn.close()
 
@@ -294,34 +273,54 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 Anti-Spam Bot is running!")
+
 # --- Main ---
 def main():
     logger.info("🚀 Starting Anti-Spam Bot...")
     
-    # Clear any webhook
+    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.CAPTION, handle_message))
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("setlimit", set_limit))
     app.add_handler(CommandHandler("setmute", set_mute))
     app.add_handler(CommandHandler("autodelete", toggle_delete))
     app.add_handler(CommandHandler("status", show_status))
-    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.CAPTION, handle_message))
     
-    logger.info("✅ Bot is running!")
+    logger.info("✅ Bot is ready!")
     
-    try:
-        app.bot.delete_webhook()
-        app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-    except Conflict:
-        logger.warning("Conflict - another instance running")
-    except Exception as e:
-        logger.error(f"Error: {e}")
+    # Run with retry logic for conflicts
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            # Clear webhook before starting
+            app.bot.delete_webhook()
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                stop_signals=None  # Prevent signal issues on Railway
+            )
+            break
+        except Conflict as e:
+            logger.warning(f"Conflict error (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                logger.info(f"Waiting {retry_delay} seconds before retry...")
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error("Max retries exceeded. Exiting...")
+                sys.exit(1)
+        except Exception as e:
+            logger.error(f"Fatal error: {e}")
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()
